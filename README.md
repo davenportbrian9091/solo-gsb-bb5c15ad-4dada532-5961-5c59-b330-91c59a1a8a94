@@ -20,6 +20,9 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
   | `anchor_collision` | warning/error | 多个标题共享同一锚点（歧义）或锚点重复定义 |
   | `cycle` | warning | 文档间循环引用（强连通分量，含自引用） |
 - **校验任务**：校验在后台任务中执行，可查询任务状态与诊断（支持按类型/路径过滤）。
+- **结果对比**：对两次 `done` 状态的校验，按稳定指纹（`type`、`severity`、
+  `path`、`line`、`message`、`details`）计算新增 / 移除 / 未变化诊断，并报告
+  两次导入之间文档的新增、删除与内容变化路径（`POST /api/validations/compare`）。
 - **修复预览**：返回受影响文档的逐行变更与完整修复后内容，**不改写代码块与正文**：
   - 锚点碰撞 → 为重复标题补充显式锚点 `{#id}`（尽量保持原锚点值不变）；
   - 断锚 → 以最相似的目标锚点重写引用片段（相似度阈值 0.6）；
@@ -31,8 +34,31 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
 ### Docker Compose（推荐）
 
 ```bash
-docker compose up --build
-# API: http://localhost:8000  (文档: /docs)
+docker compose up --build        # 构建并前台启动（-d 可后台运行）
+# API: http://localhost:8000  (交互式文档: /docs，OpenAPI: /openapi.json)
+```
+
+镜像基于 `python:3.12-slim`，启动命令为
+`uvicorn app.main:app --host 0.0.0.0 --port 8000`，数据库 schema 在容器启动时
+自动初始化，无需手动建表。SQLite 数据库固定写入容器内 `/data/app.db`
+（`DB_PATH=/data/app.db`），并通过命名卷 `mdlink-data` 持久化，重建容器后
+导入与校验记录仍然保留。
+
+常用操作：
+
+```bash
+docker compose logs -f api       # 跟踪服务日志
+docker compose down              # 停止并删除容器（保留数据卷）
+docker compose down -v           # 同时删除数据卷（清空全部历史数据）
+curl localhost:8000/health       # => {"status":"ok"}
+```
+
+需要改用其他端口时，编辑 `docker-compose.yml` 中的端口映射（如
+`"18000:8000"`）；也可以直接用 Docker 运行并自行挂载数据目录：
+
+```bash
+docker build -t mdlink-validator .
+docker run -p 8000:8000 -v "$PWD/data:/data" mdlink-validator
 ```
 
 ### 本地运行
@@ -63,6 +89,7 @@ pytest
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
+| `POST` | `/api/validations/compare` | 对比两次校验的诊断与文档差异（均须为 `done`） |
 | `GET` | `/api/validations/{validation_id}/sarif` | SARIF 2.1.0 导出（任务须为 `done`） |
 | `POST` | `/api/validations/{validation_id}/fix-preview` | 修复预览（任务须为 `done`） |
 
@@ -89,7 +116,12 @@ curl 'localhost:8000/api/validations/<validation_id>?type=broken_link&path=READM
 # 4. 修复预览
 curl -X POST localhost:8000/api/validations/<validation_id>/fix-preview
 
-# 5. SARIF 2.1.0 导出（Content-Type: application/sarif+json）
+# 5. 对比两次校验（如文档修订前后各跑一次校验）
+curl -X POST localhost:8000/api/validations/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_validation_id": "<base_id>", "target_validation_id": "<target_id>"}'
+
+# 6. SARIF 2.1.0 导出（Content-Type: application/sarif+json）
 curl localhost:8000/api/validations/<validation_id>/sarif -o results.sarif
 ```
 
@@ -113,6 +145,53 @@ curl localhost:8000/api/validations/<validation_id>/sarif -o results.sarif
   "stats": {"documents_rewritten": 1, "edits": 1, "unfixed": 1}
 }
 ```
+
+## 校验结果对比
+
+`POST /api/validations/compare` 请求体：
+
+```json
+{"base_validation_id": "<base_id>", "target_validation_id": "<target_id>"}
+```
+
+两次校验都必须处于 `done` 状态。诊断按六元组稳定指纹
+（`type`、`severity`、`path`、`line`、`message`、`details`）匹配，
+`details` 采用键排序后的规范化 JSON 参与指纹（键顺序不同视为相同）；
+匹配按多重集语义计数，重复出现的相同诊断（如循环中每个成员各一条）逐条对应。
+
+响应中：
+
+- `diagnostics.added`：target 相对 base 新出现的诊断；
+- `diagnostics.removed`：target 相对 base 消失的诊断；
+- `diagnostics.unchanged`：两次都存在的诊断（取较小出现次数）；
+- `documents.added` / `removed` / `changed`：两次导入间新增、删除的文档路径，
+  以及路径相同但内容发生变化的路径；
+- 三组诊断均按（路径、行号、类型、消息）确定性排序，文档级诊断（无行号）排在最前。
+
+```json
+{
+  "base_validation_id": "…",
+  "target_validation_id": "…",
+  "base_import_id": "…",
+  "target_import_id": "…",
+  "diagnostics": {
+    "added": [
+      {"type": "broken_anchor", "severity": "error", "path": "docs/a.md",
+       "line": 3, "message": "anchor '#x' not found in 'index.md'",
+       "details": {"target": "../index.md#x", "resolved": "index.md",
+                   "fragment": "x", "available": ["home"]}}
+    ],
+    "removed": [],
+    "unchanged": [],
+    "counts": {"added": 1, "removed": 0, "unchanged": 0}
+  },
+  "documents": {"added": ["docs/b.md"], "removed": [], "changed": ["docs/a.md"]}
+}
+```
+
+任一校验不存在返回 `404`（`validation not found`）；`pending`/`running`/
+`failed` 状态返回 `409` 并在 `detail` 中说明当前状态；请求体缺少字段或为空
+返回 `422`。两次校验可以指向同一导入，也允许与自身对比（结果为零差异）。
 
 ## SARIF 导出
 
@@ -152,6 +231,7 @@ app/
   main.py      # FastAPI 应用与路由，启动时自动初始化数据库
   parser.py    # Markdown 解析：标题/锚点/链接/代码块
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
+  comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）

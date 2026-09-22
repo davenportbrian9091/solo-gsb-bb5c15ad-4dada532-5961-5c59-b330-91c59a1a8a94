@@ -22,6 +22,11 @@ class ValidationRequest(BaseModel):
     import_id: str
 
 
+class ValidationCompareRequest(BaseModel):
+    base_validation_id: str = Field(min_length=1, max_length=64)
+    target_validation_id: str = Field(min_length=1, max_length=64)
+
+
 def normalize_doc_path(raw: str) -> str:
     """Normalize and validate a client-supplied document path.
 

@@ -8,9 +8,15 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
 
 from . import db
 from .analyzer import analyze
+from .comparison import build_comparison
 from .fixer import build_fix_preview
 from .sarif import build_sarif
-from .schemas import ImportRequest, ValidationRequest, normalize_doc_path
+from .schemas import (
+    ImportRequest,
+    ValidationCompareRequest,
+    ValidationRequest,
+    normalize_doc_path,
+)
 
 
 @asynccontextmanager
@@ -120,6 +126,38 @@ def list_validations(limit: int = Query(default=50, ge=1, le=200)) -> dict:
         for v in db.list_validations(limit)
     ]
     return {"validations": items}
+
+
+def _require_done_validation(validation_id: str, action: str) -> dict:
+    """Load a validation that must exist and be finished; raise 404/409 else."""
+    v = db.get_validation(validation_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="validation not found")
+    if v["status"] != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"validation is {v['status']}; {action} requires status 'done'",
+        )
+    return v
+
+
+@app.post("/api/validations/compare")
+def compare_validations(req: ValidationCompareRequest) -> dict:
+    base = _require_done_validation(
+        req.base_validation_id, "validation comparison"
+    )
+    target = _require_done_validation(
+        req.target_validation_id, "validation comparison"
+    )
+    result = build_comparison(
+        base_validation=base,
+        target_validation=target,
+        base_diagnostics=db.list_diagnostics(base["id"]),
+        target_diagnostics=db.list_diagnostics(target["id"]),
+        base_documents=db.get_documents(base["import_id"]),
+        target_documents=db.get_documents(target["import_id"]),
+    )
+    return result
 
 
 @app.get("/api/validations/{validation_id}")

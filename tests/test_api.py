@@ -282,6 +282,318 @@ def test_crlf_preserved_in_fix_preview(client):
     assert fixed.split("\r\n")[4] == "## Dup  {#dup-1}"
 
 
+# --------------------------------------------------------------- compare ----
+
+BASE_CORPUS = {
+    "index.md": "# Home\n\n[x](missing.md) and [y](gone.md).\n",
+    "docs/a.md": "# A\n\nBack [home](../index.md).\n",
+}
+
+TARGET_CORPUS = {
+    "index.md": "# Home\n\n[x](missing.md) and [z](new/missing.md).\n",
+    "docs/a.md": "# A\n\n[anchor](../index.md#no-such-anchor).\n",
+    "docs/b.md": "# B\n\nJust added.\n",
+}
+
+
+def test_compare_reports_diagnostic_and_document_changes(client):
+    _, base_id, _ = import_and_validate(client, BASE_CORPUS)
+    _, target_id, target_body = import_and_validate(client, TARGET_CORPUS)
+
+    r = client.post(
+        "/api/validations/compare",
+        json={
+            "base_validation_id": base_id,
+            "target_validation_id": target_id,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["base_validation_id"] == base_id
+    assert body["target_validation_id"] == target_id
+
+    added = body["diagnostics"]["added"]
+    removed = body["diagnostics"]["removed"]
+    unchanged = body["diagnostics"]["unchanged"]
+
+    # broken link to gone.md is gone; new/missing.md link and the broken
+    # anchor in docs/a.md are newly reported
+    assert {(d["type"], d["path"], d["line"]) for d in removed} == {
+        ("broken_link", "index.md", 3),
+    }
+    assert "gone.md" in removed[0]["message"]
+    assert {(d["type"], d["path"], d["line"]) for d in added} == {
+        ("broken_link", "index.md", 3),
+        ("broken_anchor", "docs/a.md", 3),
+    }
+    added_messages = [d["message"] for d in added]
+    assert any("new/missing.md" in m for m in added_messages)
+
+    # all returned diagnostics expose exactly the six fingerprint fields
+    for d in added + removed + unchanged:
+        assert set(d) == {"type", "severity", "path", "line", "message", "details"}
+
+    assert body["diagnostics"]["counts"] == {
+        "added": len(added),
+        "removed": len(removed),
+        "unchanged": len(unchanged),
+    }
+    assert target_body["summary"]["diagnostics"] == (
+        len(added) + len(unchanged)
+    )
+
+    docs = body["documents"]
+    assert docs["added"] == ["docs/b.md"]
+    assert docs["removed"] == []
+    assert docs["changed"] == ["docs/a.md", "index.md"]
+
+
+def test_compare_detects_document_removal_and_swap(client):
+    _, base_id, _ = import_and_validate(
+        client, {"a.md": "# A\n", "b.md": "# B\n"}
+    )
+    _, target_id, _ = import_and_validate(
+        client, {"a.md": "# A changed\n", "c.md": "# C\n"}
+    )
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_id, "target_validation_id": target_id},
+    )
+    assert r.status_code == 200, r.text
+    docs = r.json()["documents"]
+    assert docs == {"added": ["c.md"], "removed": ["b.md"], "changed": ["a.md"]}
+
+
+def test_compare_reverse_direction_flips_added_and_removed(client):
+    _, base_id, _ = import_and_validate(client, BASE_CORPUS)
+    _, target_id, _ = import_and_validate(client, TARGET_CORPUS)
+
+    forward = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_id, "target_validation_id": target_id},
+    ).json()
+    reverse = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": target_id, "target_validation_id": base_id},
+    ).json()
+
+    assert reverse["diagnostics"]["added"] == forward["diagnostics"]["removed"]
+    assert reverse["diagnostics"]["removed"] == forward["diagnostics"]["added"]
+    assert reverse["diagnostics"]["unchanged"] == forward["diagnostics"]["unchanged"]
+    assert reverse["documents"]["added"] == forward["documents"]["removed"]
+    assert reverse["documents"]["removed"] == forward["documents"]["added"]
+
+
+def test_compare_identical_imports_shows_everything_unchanged(client):
+    _, base_id, _ = import_and_validate(client, CORPUS)
+    _, target_id, _ = import_and_validate(client, CORPUS)
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_id, "target_validation_id": target_id},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["diagnostics"]["added"] == []
+    assert body["diagnostics"]["removed"] == []
+    assert body["diagnostics"]["counts"]["unchanged"] == 8
+    assert body["documents"] == {"added": [], "removed": [], "changed": []}
+
+
+def test_compare_self_reports_no_changes(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": vid, "target_validation_id": vid},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["diagnostics"]["added"] == []
+    assert body["diagnostics"]["removed"] == []
+    assert body["diagnostics"]["counts"]["unchanged"] == 8
+    assert body["documents"] == {"added": [], "removed": [], "changed": []}
+
+
+def test_compare_results_are_sorted_by_path_line_type_message(client):
+    base_corpus = {
+        "z.md": "# Z\n\n[z1](x1.md)\n\n[z2](x2.md)\n",
+        "a.md": "# A\n\n[a2](y2.md)\n\n[a1](y1.md)\n",
+    }
+    target_corpus = {
+        "z.md": "# Z\n\n[z1](x1.md)\n\n[z2](x2.md)\n\n[z3](x3.md)\n",
+        "a.md": "# A\n\n[a2](y2.md)\n\n[a1](y1.md)\n\n[a0](y0.md)\n",
+    }
+    _, base_id, _ = import_and_validate(client, base_corpus)
+    _, target_id, _ = import_and_validate(client, target_corpus)
+    body = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_id, "target_validation_id": target_id},
+    ).json()
+
+    keys = [
+        (d["path"], d["line"] if d["line"] is not None else -1, d["type"], d["message"])
+        for d in body["diagnostics"]["added"]
+    ]
+    assert keys == sorted(keys)
+    assert [k[0] for k in keys] == ["a.md", "z.md"]
+    assert [k[1] for k in keys] == [7, 7]
+
+
+def test_compare_doc_level_diagnostics_sort_first(client):
+    # two-doc mutual references form a cycle; removing one doc removes the
+    # cycle members (doc-level, line=None) which must sort before line-based ones
+    base_corpus = {
+        "a.md": "# A\n\nto [b](b.md), [missing](nope.md) and [old](old.md).\n",
+        "b.md": "# B\n\nto [a](a.md).\n",
+    }
+    target_corpus = {"a.md": "# A\n\n[missing](nope.md) and [other](other.md).\n"}
+    _, base_id, _ = import_and_validate(client, base_corpus)
+    _, target_id, _ = import_and_validate(client, target_corpus)
+    body = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_id, "target_validation_id": target_id},
+    ).json()
+
+    removed = body["diagnostics"]["removed"]
+    lines = [d["line"] for d in removed if d["path"] == "a.md"]
+    assert lines[0] is None  # cycle member (doc-level) precedes line diagnostics
+    keys = [
+        (d["path"], d["line"] if d["line"] is not None else -1, d["type"], d["message"])
+        for d in removed
+    ]
+    assert keys == sorted(keys)
+
+
+def test_compare_unknown_validation_returns_404(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": "does-not-exist", "target_validation_id": vid},
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "validation not found"
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": vid, "target_validation_id": "does-not-exist"},
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "validation not found"
+
+
+def test_compare_requires_done_status(client):
+    from app import db
+
+    _, done_id, _ = import_and_validate(client, CORPUS)
+    import_id = db.create_import({"a.md": "# A\n"})
+    pending_id = db.create_validation(import_id)  # stays 'pending'
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": pending_id, "target_validation_id": done_id},
+    )
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": done_id, "target_validation_id": pending_id},
+    )
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+
+    db.set_validation_running(pending_id)
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": pending_id, "target_validation_id": done_id},
+    )
+    assert r.status_code == 409
+    assert "running" in r.json()["detail"]
+
+    db.finish_validation(pending_id, "failed", error="boom")
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": pending_id, "target_validation_id": done_id},
+    )
+    assert r.status_code == 409
+    assert "failed" in r.json()["detail"]
+
+
+def test_compare_rejects_malformed_request(client):
+    r = client.post("/api/validations/compare", json={"base_validation_id": "x"})
+    assert r.status_code == 422
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": "", "target_validation_id": "y"},
+    )
+    assert r.status_code == 422
+
+
+def test_fingerprint_ignores_details_key_order():
+    from app.comparison import diff_diagnostics
+
+    d1 = {
+        "type": "broken_anchor",
+        "severity": "error",
+        "path": "a.md",
+        "line": 1,
+        "message": "m",
+        "details": {"target": "t", "resolved": "r"},
+    }
+    d2 = dict(d1, details={"resolved": "r", "target": "t"})
+    result = diff_diagnostics([d1], [d2])
+    assert result["added"] == []
+    assert result["removed"] == []
+    assert len(result["unchanged"]) == 1
+
+
+def test_fingerprint_distinguishes_diagnostic_fields():
+    from app.comparison import diff_diagnostics
+
+    base = {
+        "type": "broken_link",
+        "severity": "error",
+        "path": "a.md",
+        "line": 1,
+        "message": "m",
+        "details": {"k": "v"},
+    }
+    for field, new_value in {
+        "type": "broken_anchor",
+        "severity": "warning",
+        "path": "b.md",
+        "line": 2,
+        "message": "other",
+        "details": {"k": "w"},
+    }.items():
+        target = dict(base)
+        target[field] = new_value
+        result = diff_diagnostics([base], [target])
+        assert len(result["added"]) == 1, field
+        assert len(result["removed"]) == 1, field
+        assert result["unchanged"] == [], field
+
+
+def test_diff_diagnostics_uses_multiset_semantics():
+    # cycles emit one diagnostic per component member with identical message
+    # structure but differing paths; here two truly identical fingerprints are
+    # compared against one -> exactly one removed, one unchanged.
+    from app.comparison import diff_diagnostics
+
+    diag = {
+        "type": "cycle",
+        "severity": "warning",
+        "path": "a.md",
+        "line": None,
+        "message": "circular reference detected: a.md -> b.md -> a.md",
+        "details": {"cycle": ["a.md", "b.md"]},
+    }
+    result = diff_diagnostics([diag, diag], [diag])
+    assert len(result["removed"]) == 1
+    assert len(result["unchanged"]) == 1
+    assert result["added"] == []
+
+
 # --------------------------------------------------------------- sarif -----
 
 def test_sarif_export_maps_all_diagnostics(client):
