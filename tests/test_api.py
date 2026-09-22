@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.analyzer import analyze
+from app.compare import diagnostic_fingerprint, diff_diagnostics
 from app.main import app
 from app.parser import parse_markdown
 
@@ -280,6 +281,216 @@ def test_crlf_preserved_in_fix_preview(client):
     fixed = preview["fixed_documents"][0]["fixed_content"]
     assert "\r\n" in fixed
     assert fixed.split("\r\n")[4] == "## Dup  {#dup-1}"
+
+
+# ------------------------------------------------------------- compare ------
+
+BASE_CORPUS = {
+    "index.md": "# Home\n\nSee [stable](stable.md) and [gone](gone.md).\n",
+    "keep.md": "# Keep\n\nPlain text.\n",
+    "old.md": "# Old\n\nStill here.\n",
+}
+
+TARGET_CORPUS = {
+    "index.md": "# Home v2\n\nSee [stable](stable.md) and [fresh](fresh.md).\n",
+    "keep.md": "# Keep\n\nPlain text.\n",
+    "new.md": "# New\n\nFreshly added.\n",
+}
+
+
+def test_compare_reports_diagnostic_and_document_changes(client):
+    _, base_vid, _ = import_and_validate(client, BASE_CORPUS)
+    _, target_vid, target_body = import_and_validate(client, TARGET_CORPUS)
+
+    r = client.post(
+        "/api/validations/compare",
+        json={
+            "base_validation_id": base_vid,
+            "target_validation_id": target_vid,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["base_validation_id"] == base_vid
+    assert body["target_validation_id"] == target_vid
+    assert body["base_import_id"] != body["target_import_id"]
+
+    diagnostics = body["diagnostics"]
+    assert diagnostics["counts"] == {
+        "added": 1,
+        "removed": 1,
+        "unchanged": 1,
+    }
+
+    added = diagnostics["added"]
+    assert len(added) == 1
+    assert added[0]["type"] == "broken_link"
+    assert added[0]["path"] == "index.md"
+    assert added[0]["details"]["resolved"] == "fresh.md"
+    assert set(added[0]) == {
+        "type",
+        "severity",
+        "path",
+        "line",
+        "message",
+        "details",
+    }
+
+    removed = diagnostics["removed"]
+    assert len(removed) == 1
+    assert removed[0]["type"] == "broken_link"
+    assert removed[0]["details"]["resolved"] == "gone.md"
+
+    # the broken link to stable.md survives in both imports
+    unchanged = diagnostics["unchanged"]
+    assert len(unchanged) == 1
+    assert unchanged[0]["details"]["resolved"] == "stable.md"
+
+    documents = body["documents"]
+    assert documents["added"] == ["new.md"]
+    assert documents["removed"] == ["old.md"]
+    assert documents["changed"] == ["index.md"]
+    assert "keep.md" not in documents["added"] + documents["removed"] + documents["changed"]
+
+    # added + unchanged reproduces the target validation's diagnostics
+    counts = diagnostics["counts"]
+    assert counts["added"] + counts["unchanged"] == target_body["summary"]["diagnostics"]
+    assert counts["removed"] + counts["unchanged"] == 1 + 1  # base had 2 diagnostics
+
+
+def test_compare_is_symmetric_for_added_and_removed(client):
+    _, base_vid, _ = import_and_validate(client, BASE_CORPUS)
+    _, target_vid, _ = import_and_validate(client, TARGET_CORPUS)
+
+    forward = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_vid, "target_validation_id": target_vid},
+    ).json()
+    backward = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": target_vid, "target_validation_id": base_vid},
+    ).json()
+
+    assert forward["diagnostics"]["added"] == backward["diagnostics"]["removed"]
+    assert forward["diagnostics"]["removed"] == backward["diagnostics"]["added"]
+    assert forward["diagnostics"]["unchanged"] == backward["diagnostics"]["unchanged"]
+    assert backward["documents"]["added"] == ["old.md"]
+    assert backward["documents"]["removed"] == ["new.md"]
+
+
+def test_compare_same_validation_is_all_unchanged(client):
+    _, vid, body = import_and_validate(client, CORPUS)
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": vid, "target_validation_id": vid},
+    )
+    assert r.status_code == 200, r.text
+    result = r.json()
+
+    assert result["diagnostics"]["added"] == []
+    assert result["diagnostics"]["removed"] == []
+    assert len(result["diagnostics"]["unchanged"]) == body["summary"]["diagnostics"]
+    assert result["documents"] == {"added": [], "removed": [], "changed": []}
+
+    # unchanged diagnostics are ordered by path, line, type, message;
+    # doc-level diagnostics (cycle, line=None) sort before line-based ones
+    keys = [(d["path"], d["line"], d["type"], d["message"]) for d in result["diagnostics"]["unchanged"]]
+    assert keys == sorted(keys, key=lambda k: (k[0], k[1] if k[1] is not None else -1, k[2], k[3]))
+    assert {d["type"] for d in result["diagnostics"]["unchanged"] if d["line"] is None} == {"cycle"}
+
+
+def test_compare_results_are_sorted_by_path_line_type_message(client):
+    base = {
+        "b.md": "# B\n\n[z](missing-z.md).\n",
+        "a.md": "# A\n\n[x](missing-x.md) and [y](missing-y.md).\n",
+    }
+    target = {
+        "b.md": "# B\n\n[q](missing-q.md).\n",
+        "a.md": "# A\n\n[x](missing-x.md) and [y](missing-y2.md).\n",
+    }
+    _, base_vid, _ = import_and_validate(client, base)
+    _, target_vid, _ = import_and_validate(client, target)
+
+    body = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": base_vid, "target_validation_id": target_vid},
+    ).json()
+
+    added = [(d["path"], d["line"], d["type"], d["message"]) for d in body["diagnostics"]["added"]]
+    assert added == sorted(added, key=lambda k: (k[0], k[1] if k[1] is not None else -1, k[2], k[3]))
+    assert [k[0] for k in added] == ["a.md", "b.md"]
+    assert added[0][1] == 3  # missing-y2 message change => added diag on a.md line 3
+    assert [d["path"] for d in body["diagnostics"]["unchanged"]] == ["a.md"]
+    assert [d["path"] for d in body["diagnostics"]["removed"]] == ["a.md", "b.md"]
+
+
+def test_compare_missing_and_unfinished_validations_return_4xx(client):
+    _, vid, _ = import_and_validate(client, BASE_CORPUS)
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": "nope", "target_validation_id": vid},
+    )
+    assert r.status_code == 404
+    assert "base" in r.json()["detail"]
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": vid, "target_validation_id": "nope"},
+    )
+    assert r.status_code == 404
+    assert "target" in r.json()["detail"]
+
+    # unfinished validation -> 409 with the current status in the detail
+    from app import db
+
+    import_id = db.create_import({"a.md": "# A\n"})
+    pending_vid = db.create_validation(import_id)
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": pending_vid, "target_validation_id": vid},
+    )
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+    assert "base" in r.json()["detail"]
+
+    r = client.post(
+        "/api/validations/compare",
+        json={"base_validation_id": vid, "target_validation_id": pending_vid},
+    )
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+    assert "target" in r.json()["detail"]
+
+
+def test_compare_rejects_missing_body_fields(client):
+    r = client.post("/api/validations/compare", json={"base_validation_id": "x"})
+    assert r.status_code == 422
+    r = client.post("/api/validations/compare", json={})
+    assert r.status_code == 422
+
+
+def test_diagnostic_fingerprint_is_stable_and_order_independent():
+    a = {
+        "type": "broken_anchor",
+        "severity": "error",
+        "path": "a.md",
+        "line": 3,
+        "message": "anchor '#x' not found in 'b.md'",
+        "details": {"fragment": "x", "resolved": "b.md"},
+    }
+    b = dict(a, details={"resolved": "b.md", "fragment": "x"})
+    assert diagnostic_fingerprint(a) == diagnostic_fingerprint(b)
+
+    changed = dict(a, line=4)
+    assert diagnostic_fingerprint(a) != diagnostic_fingerprint(changed)
+
+    # multiset semantics: duplicated fingerprints are matched per occurrence
+    diff = diff_diagnostics([a, a, changed], [a, changed])
+    assert len(diff["removed"]) == 1
+    assert diff["added"] == []
+    assert len(diff["unchanged"]) == 2
 
 
 # --------------------------------------------------------------- sarif -----

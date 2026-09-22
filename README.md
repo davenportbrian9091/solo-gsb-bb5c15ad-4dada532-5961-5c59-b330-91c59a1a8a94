@@ -63,6 +63,7 @@ pytest
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
+| `POST` | `/api/validations/compare` | 对比两次校验的诊断与文档差异（均须为 `done`） |
 | `GET` | `/api/validations/{validation_id}/sarif` | SARIF 2.1.0 导出（任务须为 `done`） |
 | `POST` | `/api/validations/{validation_id}/fix-preview` | 修复预览（任务须为 `done`） |
 
@@ -93,6 +94,57 @@ curl -X POST localhost:8000/api/validations/<validation_id>/fix-preview
 curl localhost:8000/api/validations/<validation_id>/sarif -o results.sarif
 ```
 
+## 校验结果对比
+
+修改文档并重新导入、校验后，可用
+`POST /api/validations/compare` 对比两次**已完成**的校验任务：
+
+```bash
+curl -X POST localhost:8000/api/validations/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_validation_id": "<旧 validation_id>",
+       "target_validation_id": "<新 validation_id>"}'
+```
+
+- 诊断按**稳定指纹**匹配，指纹由
+  `type`、`severity`、`path`、`line`、`message`、`details` 六个字段构成
+  （`details` 按结构比较，键顺序不影响结果）；指纹相同时按多重集逐一对消，
+  因此重复诊断也能正确计数：
+  - `added`：目标任务中新出现的诊断；
+  - `removed`：基线任务中消失的诊断；
+  - `unchanged`：两次任务中指纹相同的诊断。
+- 同时对比两次导入的文档集合：
+  - `documents.added` / `removed`：目标导入相对基线新增 / 删除的文档路径；
+  - `documents.changed`：路径相同但内容发生变化的文档。
+- 三组诊断均按 **路径、行号、类型、消息** 确定性排序；文档级诊断（如
+  `cycle`，无行号）排在同路径最前；重复请求结果一致。
+
+响应示例：
+
+```json
+{
+  "base_validation_id": "…",
+  "target_validation_id": "…",
+  "base_import_id": "…",
+  "target_import_id": "…",
+  "diagnostics": {
+    "added":     [ {"type": "broken_link", "severity": "error", "path": "index.md", "line": 3, "message": "…", "details": {"resolved": "fresh.md"}} ],
+    "removed":   [ {"type": "broken_link", "severity": "error", "path": "index.md", "line": 3, "message": "…", "details": {"resolved": "gone.md"}} ],
+    "unchanged": [ {"type": "broken_link", "severity": "error", "path": "index.md", "line": 3, "message": "…", "details": {"resolved": "stable.md"}} ],
+    "counts": {"added": 1, "removed": 1, "unchanged": 1}
+  },
+  "documents": {
+    "added": ["new.md"],
+    "removed": ["old.md"],
+    "changed": ["index.md"]
+  }
+}
+```
+
+错误情况（明确的 4xx）：`base_validation_id` 或 `target_validation_id`
+不存在时返回 `404`（`detail` 标明是哪一方）；任一任务不是 `done`
+（`pending`/`running`/`failed`）时返回 `409` 并在 `detail` 中说明当前状态；
+请求体缺字段返回 `422`。
 修复预览响应：
 
 ```json
@@ -154,6 +206,7 @@ app/
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
   fixer.py     # 修复预览：最小化重写锚点与引用
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
+  compare.py   # 校验结果对比：稳定指纹差异与文档增删/变化
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）
   schemas.py   # 请求模型与路径校验
 tests/
